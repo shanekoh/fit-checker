@@ -69,7 +69,9 @@ class ShareActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun loadInstagramPage(url: String) {
-        webView = WebView(this).also { setContentView(it) }.apply {
+        setContentView(R.layout.activity_share_loading)
+        val container = findViewById<android.widget.FrameLayout>(R.id.webViewContainer)
+        webView = WebView(this).also { container.addView(it) }.apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.userAgentString =

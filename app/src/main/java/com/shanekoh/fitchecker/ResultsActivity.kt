@@ -7,15 +7,12 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
-import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
-import androidx.recyclerview.widget.DividerItemDecoration
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -36,12 +33,7 @@ data class Product(
     val score: Double
 )
 
-sealed class ListItem {
-    data class OutfitCard(val description: String, val query: String, val imagePath: String) : ListItem()
-    data class SectionHeader(val title: String) : ListItem()
-    data class ProductCard(val product: Product) : ListItem()
-    data class RetailerRow(val retailer: Retailer, val searchUrl: String) : ListItem()
-}
+data class ResultGroup(val itemName: String, val products: List<Product>)
 
 class ResultsActivity : AppCompatActivity() {
 
@@ -59,117 +51,228 @@ class ResultsActivity : AppCompatActivity() {
 
         val imagePath = intent.getStringExtra(EXTRA_IMAGE_PATH) ?: run { finish(); return }
         val imageFile = File(imagePath)
-
-        val recyclerView = findViewById<RecyclerView>(R.id.recyclerView)
-        recyclerView.layoutManager = LinearLayoutManager(this)
-        recyclerView.addItemDecoration(DividerItemDecoration(this, DividerItemDecoration.VERTICAL))
-
         val retailers = loadRetailers()
-        fetchAndShow(imageFile, retailers, recyclerView)
+
+        Thread { runPipeline(imageFile, retailers) }.start()
     }
 
     override fun onSupportNavigateUp(): Boolean { finish(); return true }
 
-    private fun loadRetailers(): List<Retailer> {
-        return try {
-            val json = resources.openRawResource(R.raw.retailers).bufferedReader().readText()
-            val array = JSONArray(json)
-            (0 until array.length()).map {
-                val obj = array.getJSONObject(it)
-                Retailer(obj.getString("name"), obj.getString("url"))
+    // ── Main pipeline ─────────────────────────────────────────────────────────
+    //
+    // 1. Claude analysis + Lykdat search run in PARALLEL
+    // 2. Claude result triggers Phase 1 (outfit card) immediately
+    // 3. After BOTH finish → Claude re-ranks Lykdat results by color + style
+    // 4. Re-ranked results trigger Phase 2 (product columns)
+
+    private fun runPipeline(imageFile: File, retailers: List<Retailer>) {
+        val claudeRef = AtomicReference<Triple<String, String, List<String>>?>()
+        val lykdatRef = AtomicReference<List<ResultGroup>?>()
+        val latch = CountDownLatch(2)
+
+        // Thread A: Claude outfit analysis — triggers Phase 1 as soon as done
+        Thread {
+            try {
+                val result = callClaude(imageFile)
+                claudeRef.set(result)
+                runOnUiThread { showPhase1(imageFile, result.first, result.second) }
+            } catch (e: Exception) {
+                runOnUiThread { showPhase1(imageFile, "", "") }
             }
-        } catch (e: Exception) { emptyList() }
+            latch.countDown()
+        }.start()
+
+        // Thread B: Lykdat visual search — runs fully in parallel
+        Thread {
+            try { lykdatRef.set(callLykdat(imageFile)) } catch (e: Exception) { }
+            latch.countDown()
+        }.start()
+
+        // Wait for both, then re-rank and show Phase 2
+        latch.await()
+
+        val analysis = claudeRef.get()
+        val rawGroups = lykdatRef.get() ?: emptyList()
+
+        if (rawGroups.isEmpty()) {
+            runOnUiThread {
+                findViewById<View>(R.id.columnsLoading).visibility = View.GONE
+                Toast.makeText(this, "No product matches found", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        // Re-rank: Claude looks at the image + Lykdat products, picks best color+style matches
+        val reranked = try {
+            callClaudeRerank(imageFile, analysis?.third ?: emptyList(), rawGroups)
+        } catch (e: Exception) {
+            // Fallback: basic color filter if re-ranking fails
+            applyColorFilter(rawGroups, analysis?.third ?: emptyList())
+        }
+
+        runOnUiThread { showPhase2(reranked, retailers) }
     }
 
-    private fun fetchAndShow(imageFile: File, retailers: List<Retailer>, recyclerView: RecyclerView) {
-        Thread {
-            val claudeResult = AtomicReference<Triple<String, String, List<String>>?>()
-            val lykdatResult = AtomicReference<List<Product>?>()
-            val latch = CountDownLatch(2)
+    // ── Phase 1: Show outfit image + Claude description ───────────────────────
 
-            Thread {
-                try { claudeResult.set(callClaude(imageFile)) } catch (e: Exception) { }
-                latch.countDown()
-            }.start()
+    private fun showPhase1(imageFile: File, description: String, query: String) {
+        findViewById<View>(R.id.loadingView).visibility = View.GONE
+        findViewById<View>(R.id.outfitSection).visibility = View.VISIBLE
 
-            Thread {
-                try { lykdatResult.set(callLykdat(imageFile)) } catch (e: Exception) { }
-                latch.countDown()
-            }.start()
+        val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+        if (bitmap != null) findViewById<ImageView>(R.id.ivOutfitImage).setImageBitmap(bitmap)
+        findViewById<TextView>(R.id.tvDescription).text = description
+        findViewById<TextView>(R.id.tvQuery).text = query
+    }
 
-            latch.await()
+    // ── Phase 2: Populate product columns ────────────────────────────────────
 
-            val claude = claudeResult.get()
-            val rawProducts = lykdatResult.get() ?: emptyList()
+    private fun showPhase2(groups: List<ResultGroup>, retailers: List<Retailer>) {
+        findViewById<View>(R.id.columnsLoading).visibility = View.GONE
 
-            if (claude == null && rawProducts.isEmpty()) {
-                runOnUiThread {
-                    Toast.makeText(this, "Search failed. Check your connection.", Toast.LENGTH_LONG).show()
-                    finish()
-                }
-                return@Thread
-            }
+        if (groups.isEmpty()) return
 
-            val colors = claude?.third ?: emptyList()
+        val columnsSection = findViewById<LinearLayout>(R.id.columnsSection)
+        columnsSection.visibility = View.VISIBLE
 
-            // Step 1: filter by color — keep only products whose name contains at least one outfit color
-            val colorFiltered = if (colors.isEmpty()) rawProducts else {
-                rawProducts.filter { p ->
-                    colors.any { color -> p.name.lowercase().contains(color) }
-                }.ifEmpty { rawProducts } // fallback to all if nothing matches
-            }
+        val cols = listOf(
+            findViewById<LinearLayout>(R.id.col0),
+            findViewById<LinearLayout>(R.id.col1),
+            findViewById<LinearLayout>(R.id.col2)
+        )
+        val headers = listOf(
+            findViewById<TextView>(R.id.colHeader0),
+            findViewById<TextView>(R.id.colHeader1),
+            findViewById<TextView>(R.id.colHeader2)
+        )
+        val dividers = listOf(
+            findViewById<View>(R.id.divider01),
+            findViewById<View>(R.id.divider12)
+        )
 
-            // Step 2: deduplicate — one product per brand (highest score)
-            val dedupedByBrand = colorFiltered
+        val retailerNames = retailers.map { it.name.lowercase() }.toSet()
+
+        groups.take(3).forEachIndexed { i, group ->
+            cols[i].visibility = View.VISIBLE
+            headers[i].text = group.itemName.uppercase()
+            if (i > 0) dividers[i - 1].visibility = View.VISIBLE
+
+            // Dedup by brand, prioritise retailer-config brands, show top 4
+            val deduped = group.products
                 .groupBy { it.brand.lowercase().ifEmpty { it.url } }
-                .values
-                .map { group -> group.maxByOrNull { it.score }!! }
-
-            // Step 3: prioritise brands from the retailers config list, then sort by score
-            val retailerNames = retailers.map { it.name.lowercase() }.toSet()
-            val (prioritised, others) = dedupedByBrand.partition { p ->
+                .values.map { it.maxByOrNull { p -> p.score }!! }
+            val (priority, rest) = deduped.partition { p ->
                 p.brand.lowercase() in retailerNames ||
                 retailerNames.any { r -> p.brand.lowercase().contains(r) || r.contains(p.brand.lowercase()) }
             }
-            val top10 = (prioritised.sortedByDescending { it.score } +
-                         others.sortedByDescending { it.score }).take(10)
+            val top4 = (priority.sortedByDescending { it.score } +
+                        rest.sortedByDescending { it.score }).take(4)
 
-            val items = mutableListOf<ListItem>()
-            items.add(ListItem.OutfitCard(
-                claude?.first ?: "Outfit analysis unavailable",
-                claude?.second ?: "",
-                imageFile.absolutePath
-            ))
-            if (top10.isNotEmpty()) {
-                items.add(ListItem.SectionHeader("BEST MATCHES"))
-                top10.forEach { items.add(ListItem.ProductCard(it)) }
-            }
-
-            runOnUiThread {
-                findViewById<View>(R.id.loadingLayout).visibility = View.GONE
-                recyclerView.visibility = View.VISIBLE
-                recyclerView.adapter = ResultsAdapter(items) { url ->
-                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                }
-            }
-        }.start()
+            top4.forEach { addProductCard(cols[i], it) }
+        }
     }
+
+    private fun addProductCard(column: LinearLayout, product: Product) {
+        val card = LayoutInflater.from(this).inflate(R.layout.item_mini_product, column, false)
+        val thumbnail = card.findViewById<ImageView>(R.id.ivMiniProduct)
+        card.findViewById<TextView>(R.id.tvMiniBrand).text = product.brand.uppercase()
+        card.findViewById<TextView>(R.id.tvMiniName).text = product.name
+        card.findViewById<TextView>(R.id.tvMiniPrice).text = product.price
+        card.setOnClickListener {
+            if (product.url.isNotEmpty())
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(product.url)))
+        }
+        column.addView(card)
+
+        if (product.imageUrl.isNotEmpty()) {
+            Thread {
+                val bmp = loadBitmap(product.imageUrl)
+                if (bmp != null) thumbnail.post { thumbnail.setImageBitmap(bmp) }
+            }.start()
+        }
+    }
+
+    // ── API calls ─────────────────────────────────────────────────────────────
 
     private fun callClaude(imageFile: File): Triple<String, String, List<String>> {
         val base64Image = android.util.Base64.encodeToString(imageFile.readBytes(), android.util.Base64.NO_WRAP)
-
         val prompt = """
-            Analyze the outfit in this image and return ONLY valid JSON with no markdown or extra text:
+            Analyze the outfit in this image and return ONLY valid JSON with no markdown:
             {
               "description": "1-2 sentence description of the outfit",
               "search_query": "concise search terms to find similar items",
-              "colors": ["list every dominant color in the outfit as simple color words e.g. white, black, navy, beige, red, green, brown, grey, pink, cream, ivory, camel, tan, rust, olive, cobalt, emerald, burgundy, coral"]
+              "colors": ["every dominant color as simple words e.g. white, black, navy, beige, cream, ivory, camel, rust, olive, emerald, burgundy, coral, tan, brown, grey, pink, red, green, blue, yellow, orange, purple"]
             }
         """.trimIndent()
 
+        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 512)
+        val rawText = JSONObject(responseText)
+            .getJSONArray("content").getJSONObject(0).getString("text")
+            .trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+
+        val parsed = JSONObject(rawText)
+        val colorsArray = parsed.optJSONArray("colors") ?: JSONArray()
+        val colors = (0 until colorsArray.length()).map { colorsArray.getString(it).lowercase() }
+        return Triple(parsed.getString("description"), parsed.getString("search_query"), colors)
+    }
+
+    // Re-ranking pass: Claude sees the outfit image + Lykdat product list,
+    // picks only products that truly match in color and style.
+    private fun callClaudeRerank(
+        imageFile: File,
+        colors: List<String>,
+        groups: List<ResultGroup>
+    ): List<ResultGroup> {
+        val base64Image = android.util.Base64.encodeToString(imageFile.readBytes(), android.util.Base64.NO_WRAP)
+
+        // Build compact product listing (max 15 per group to stay within token budget)
+        val groupsText = groups.mapIndexed { gi, group ->
+            "Group $gi — ${group.itemName.uppercase()}:\n" +
+            group.products.take(15).mapIndexed { pi, p ->
+                "$pi. ${p.brand.ifEmpty { "Unknown" }} | ${p.name} | ${p.price}"
+            }.joinToString("\n")
+        }.joinToString("\n\n")
+
+        val colorStr = if (colors.isNotEmpty()) colors.joinToString(", ") else "unknown"
+
+        val prompt = """
+            The outfit in the image has these dominant colors: $colorStr.
+
+            For each product group below, select ONLY the product indices that:
+            1. Match the outfit's EXACT COLORS (most important — reject wrong colors)
+            2. Match the outfit's STYLE (silhouette, formality, aesthetic)
+
+            Be strict. If nothing matches well, return an empty keep list.
+            Return ONLY valid JSON (no markdown, no explanation):
+            {"groups": [{"keep": [0, 2]}, {"keep": [1]}, {"keep": []}]}
+
+            $groupsText
+        """.trimIndent()
+
+        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 256)
+        val rawText = JSONObject(responseText)
+            .getJSONArray("content").getJSONObject(0).getString("text")
+            .trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+
+        val parsedGroups = JSONObject(rawText).optJSONArray("groups") ?: return groups
+
+        return groups.mapIndexed { gi, group ->
+            if (gi >= parsedGroups.length()) return@mapIndexed group
+
+            val keepArray = parsedGroups.getJSONObject(gi).optJSONArray("keep") ?: JSONArray()
+            val keepIndices = (0 until keepArray.length()).map { keepArray.getInt(it) }.toSet()
+
+            val kept = group.products.take(15).filterIndexed { pi, _ -> pi in keepIndices }
+            // Fallback to top 3 by score if Claude kept nothing
+            ResultGroup(group.itemName, kept.ifEmpty { group.products.sortedByDescending { it.score }.take(3) })
+        }
+    }
+
+    // Shared Anthropic API call (image + text message)
+    private fun postToAnthropic(base64Image: String, prompt: String, maxTokens: Int): String {
         val requestBody = JSONObject().apply {
             put("model", "claude-haiku-4-5-20251001")
-            put("max_tokens", 512)
+            put("max_tokens", maxTokens)
             put("messages", JSONArray().put(JSONObject().apply {
                 put("role", "user")
                 put("content", JSONArray().apply {
@@ -181,10 +284,7 @@ class ResultsActivity : AppCompatActivity() {
                             put("data", base64Image)
                         })
                     })
-                    put(JSONObject().apply {
-                        put("type", "text")
-                        put("text", prompt)
-                    })
+                    put(JSONObject().apply { put("type", "text"); put("text", prompt) })
                 })
             }))
         }
@@ -198,24 +298,13 @@ class ResultsActivity : AppCompatActivity() {
         connection.connectTimeout = 30000
         connection.readTimeout = 30000
         connection.outputStream.use { it.write(requestBody.toString().toByteArray()) }
-
-        val responseText = connection.inputStream.bufferedReader().readText()
+        val text = connection.inputStream.bufferedReader().readText()
         connection.disconnect()
-
-        val rawText = JSONObject(responseText)
-            .getJSONArray("content").getJSONObject(0).getString("text")
-            .trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-
-        val parsed = JSONObject(rawText)
-        val colorsArray = parsed.optJSONArray("colors") ?: JSONArray()
-        val colors = (0 until colorsArray.length()).map { colorsArray.getString(it).lowercase() }
-        return Triple(parsed.getString("description"), parsed.getString("search_query"), colors)
+        return text
     }
 
-    private fun callLykdat(imageFile: File): List<Product> {
+    private fun callLykdat(imageFile: File): List<ResultGroup> {
         val boundary = "----FitCheckerBoundary${System.currentTimeMillis()}"
-
-        // Build multipart body
         val baos = ByteArrayOutputStream()
         baos.write("--$boundary\r\nContent-Disposition: form-data; name=\"api_key\"\r\n\r\n${BuildConfig.LYKDAT_API_KEY}\r\n".toByteArray())
         baos.write("--$boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"outfit.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
@@ -233,149 +322,65 @@ class ResultsActivity : AppCompatActivity() {
         connection.outputStream.use { it.write(body) }
 
         val responseCode = connection.responseCode
-        val responseText = if (responseCode == 200) {
+        val responseText = if (responseCode == 200)
             connection.inputStream.bufferedReader().readText()
-        } else {
-            connection.errorStream?.bufferedReader()?.readText() ?: ""
-        }
+        else connection.errorStream?.bufferedReader()?.readText() ?: ""
         connection.disconnect()
 
         if (responseCode != 200) return emptyList()
 
-        val products = mutableListOf<Product>()
-        val resultGroups = JSONObject(responseText)
-            .getJSONObject("data")
-            .getJSONArray("result_groups")
+        val resultGroupsJson = JSONObject(responseText)
+            .getJSONObject("data").getJSONArray("result_groups")
 
-        for (i in 0 until resultGroups.length()) {
-            val similar = resultGroups.getJSONObject(i).getJSONArray("similar_products")
-            for (j in 0 until similar.length()) {
-                val p = similar.getJSONObject(j)
-                val imageUrl = p.optJSONArray("images")?.optString(0) ?: ""
-                products.add(Product(
-                    name = p.optString("name", "Unknown"),
+        return (0 until minOf(3, resultGroupsJson.length())).map { i ->
+            val g = resultGroupsJson.getJSONObject(i)
+            val itemName = g.getJSONObject("detected_item").optString("name", "Item")
+            val similarJson = g.getJSONArray("similar_products")
+            val products = (0 until similarJson.length()).map { j ->
+                val p = similarJson.getJSONObject(j)
+                Product(
+                    name = p.optString("name", ""),
                     brand = p.optString("brand_name", ""),
                     price = p.optString("price", ""),
                     url = p.optString("url", ""),
-                    imageUrl = imageUrl,
+                    imageUrl = p.optJSONArray("images")?.optString(0) ?: "",
                     score = p.optDouble("score", 0.0)
-                ))
+                )
             }
-        }
-
-        return products.sortedByDescending { it.score }.take(10)
-    }
-
-    private fun buildSearchUrl(retailer: Retailer, query: String): String {
-        val base = retailer.url.trimEnd('/')
-        return "$base/search?q=${Uri.encode(query)}"
-    }
-}
-
-class ResultsAdapter(
-    private val items: List<ListItem>,
-    private val onItemClick: (String) -> Unit
-) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
-
-    companion object {
-        private const val TYPE_OUTFIT_CARD = 0
-        private const val TYPE_SECTION_HEADER = 1
-        private const val TYPE_PRODUCT = 2
-        private const val TYPE_RETAILER = 3
-    }
-
-    override fun getItemViewType(position: Int) = when (items[position]) {
-        is ListItem.OutfitCard -> TYPE_OUTFIT_CARD
-        is ListItem.SectionHeader -> TYPE_SECTION_HEADER
-        is ListItem.ProductCard -> TYPE_PRODUCT
-        is ListItem.RetailerRow -> TYPE_RETAILER
-    }
-
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
-        val inflater = LayoutInflater.from(parent.context)
-        return when (viewType) {
-            TYPE_OUTFIT_CARD -> OutfitCardHolder(inflater.inflate(R.layout.item_outfit_card, parent, false))
-            TYPE_SECTION_HEADER -> SectionHeaderHolder(inflater.inflate(R.layout.item_section_header, parent, false))
-            TYPE_PRODUCT -> ProductHolder(inflater.inflate(R.layout.item_product_card, parent, false))
-            else -> RetailerHolder(inflater.inflate(R.layout.item_retailer, parent, false))
+            ResultGroup(itemName, products)
         }
     }
 
-    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-        when (val item = items[position]) {
-            is ListItem.OutfitCard -> (holder as OutfitCardHolder).bind(item)
-            is ListItem.SectionHeader -> (holder as SectionHeaderHolder).bind(item)
-            is ListItem.ProductCard -> (holder as ProductHolder).bind(item, onItemClick)
-            is ListItem.RetailerRow -> (holder as RetailerHolder).bind(item, onItemClick)
-        }
-    }
-
-    override fun getItemCount() = items.size
-
-    class OutfitCardHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val image: ImageView = view.findViewById(R.id.ivOutfitImage)
-        private val description: TextView = view.findViewById(R.id.tvDescription)
-        private val query: TextView = view.findViewById(R.id.tvQuery)
-        fun bind(item: ListItem.OutfitCard) {
-            val bitmap = BitmapFactory.decodeFile(item.imagePath)
-            if (bitmap != null) image.setImageBitmap(bitmap)
-            description.text = item.description
-            query.text = item.query
-        }
-    }
-
-    class SectionHeaderHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val title: TextView = view.findViewById(R.id.tvSectionTitle)
-        fun bind(item: ListItem.SectionHeader) { title.text = item.title }
-    }
-
-    class ProductHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val thumbnail: ImageView = view.findViewById(R.id.ivProductImage)
-        private val brand: TextView = view.findViewById(R.id.tvBrand)
-        private val name: TextView = view.findViewById(R.id.tvProductName)
-        private val price: TextView = view.findViewById(R.id.tvPrice)
-        private val score: TextView = view.findViewById(R.id.tvScore)
-
-        fun bind(item: ListItem.ProductCard, onClick: (String) -> Unit) {
-            val p = item.product
-            brand.text = p.brand.uppercase()
-            name.text = p.name
-            price.text = p.price.ifEmpty { "" }
-            score.text = "${(p.score * 100).toInt()}% match"
-            thumbnail.setImageResource(android.R.color.darker_gray)
-
-            if (p.imageUrl.isNotEmpty()) {
-                Thread {
-                    try {
-                        val bmp = loadBitmap(p.imageUrl)
-                        if (bmp != null) thumbnail.post { thumbnail.setImageBitmap(bmp) }
-                    } catch (e: Exception) { /* keep placeholder */ }
-                }.start()
+    // Fallback color filter (used if re-ranking API call fails)
+    private fun applyColorFilter(groups: List<ResultGroup>, colors: List<String>): List<ResultGroup> {
+        if (colors.isEmpty()) return groups
+        return groups.map { group ->
+            val filtered = group.products.filter { p ->
+                colors.any { c -> p.name.lowercase().contains(c) }
             }
-
-            itemView.setOnClickListener { if (p.url.isNotEmpty()) onClick(p.url) }
-        }
-
-        private fun loadBitmap(url: String): Bitmap? {
-            val connection = URL(url).openConnection() as HttpURLConnection
-            connection.connectTimeout = 8000
-            connection.readTimeout = 8000
-            return try {
-                connection.connect()
-                if (connection.responseCode == 200)
-                    BitmapFactory.decodeStream(connection.inputStream)
-                else null
-            } finally {
-                connection.disconnect()
-            }
+            ResultGroup(group.itemName, filtered.ifEmpty { group.products })
         }
     }
 
-    class RetailerHolder(view: View) : RecyclerView.ViewHolder(view) {
-        private val name: TextView = view.findViewById(R.id.tvRetailerName)
-        fun bind(item: ListItem.RetailerRow, onClick: (String) -> Unit) {
-            name.text = item.retailer.name
-            itemView.setOnClickListener { onClick(item.searchUrl) }
-        }
+    private fun loadRetailers(): List<Retailer> {
+        return try {
+            val json = resources.openRawResource(R.raw.retailers).bufferedReader().readText()
+            val array = JSONArray(json)
+            (0 until array.length()).map {
+                val obj = array.getJSONObject(it)
+                Retailer(obj.getString("name"), obj.getString("url"))
+            }
+        } catch (e: Exception) { emptyList() }
+    }
+
+    private fun loadBitmap(url: String): Bitmap? {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 8000
+        connection.readTimeout = 8000
+        return try {
+            connection.connect()
+            if (connection.responseCode == 200) BitmapFactory.decodeStream(connection.inputStream)
+            else null
+        } finally { connection.disconnect() }
     }
 }

@@ -13,38 +13,210 @@
         android:elevation="4dp"
         app:title="Fit Checker" />
 
-    <FrameLayout
+    <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:fillViewport="true">
 
-        <!-- Loading state -->
         <LinearLayout
-            android:id="@+id/loadingLayout"
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:gravity="center"
+            android:layout_height="wrap_content"
             android:orientation="vertical">
 
-            <ProgressBar
-                android:layout_width="48dp"
-                android:layout_height="48dp" />
+            <!-- PHASE 0: Full-screen loading spinner -->
+            <LinearLayout
+                android:id="@+id/loadingView"
+                android:layout_width="match_parent"
+                android:layout_height="420dp"
+                android:orientation="vertical"
+                android:gravity="center">
 
-            <TextView
-                android:layout_width="wrap_content"
+                <ProgressBar
+                    android:layout_width="52dp"
+                    android:layout_height="52dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:text="Analysing outfit..."
+                    android:textSize="17sp" />
+
+            </LinearLayout>
+
+            <!-- PHASE 1: Outfit card — shown as soon as Claude responds -->
+            <LinearLayout
+                android:id="@+id/outfitSection"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:text="Analysing outfit..."
-                android:textSize="16sp" />
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <ImageView
+                    android:id="@+id/ivOutfitImage"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:adjustViewBounds="true"
+                    android:scaleType="fitCenter"
+                    android:contentDescription="Outfit" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="OUTFIT ANALYSIS"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:textColor="?attr/colorPrimary"
+                        android:letterSpacing="0.08" />
+
+                    <TextView
+                        android:id="@+id/tvDescription"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:textSize="14sp"
+                        android:lineSpacingMultiplier="1.3" />
+
+                    <TextView
+                        android:id="@+id/tvQuery"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="#1A000000"
+                        android:padding="8dp"
+                        android:textSize="11sp"
+                        android:textColor="?android:textColorSecondary"
+                        android:fontFamily="monospace" />
+
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#E0E0E0" />
+
+                <!-- PHASE 2a: Shown while Lykdat loads -->
+                <LinearLayout
+                    android:id="@+id/columnsLoading"
+                    android:layout_width="match_parent"
+                    android:layout_height="200dp"
+                    android:orientation="vertical"
+                    android:gravity="center">
+
+                    <ProgressBar
+                        android:layout_width="36dp"
+                        android:layout_height="36dp" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp"
+                        android:text="Finding product matches..."
+                        android:textSize="14sp"
+                        android:textColor="?android:textColorSecondary" />
+
+                </LinearLayout>
+
+                <!-- PHASE 2b: Product columns — shown when Lykdat responds -->
+                <LinearLayout
+                    android:id="@+id/columnsSection"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:visibility="gone">
+
+                    <!-- Column 0 (always shown) -->
+                    <LinearLayout
+                        android:id="@+id/col0"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/colHeader0"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:padding="10dp"
+                            android:textSize="11sp"
+                            android:textStyle="bold"
+                            android:textColor="?attr/colorPrimary"
+                            android:letterSpacing="0.08"
+                            android:background="?attr/colorSurfaceVariant" />
+
+                    </LinearLayout>
+
+                    <View
+                        android:id="@+id/divider01"
+                        android:layout_width="1dp"
+                        android:layout_height="match_parent"
+                        android:background="#E0E0E0"
+                        android:visibility="gone" />
+
+                    <!-- Column 1 -->
+                    <LinearLayout
+                        android:id="@+id/col1"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:visibility="gone">
+
+                        <TextView
+                            android:id="@+id/colHeader1"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:padding="10dp"
+                            android:textSize="11sp"
+                            android:textStyle="bold"
+                            android:textColor="?attr/colorPrimary"
+                            android:letterSpacing="0.08"
+                            android:background="?attr/colorSurfaceVariant" />
+
+                    </LinearLayout>
+
+                    <View
+                        android:id="@+id/divider12"
+                        android:layout_width="1dp"
+                        android:layout_height="match_parent"
+                        android:background="#E0E0E0"
+                        android:visibility="gone" />
+
+                    <!-- Column 2 -->
+                    <LinearLayout
+                        android:id="@+id/col2"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical"
+                        android:visibility="gone">
+
+                        <TextView
+                            android:id="@+id/colHeader2"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:padding="10dp"
+                            android:textSize="11sp"
+                            android:textStyle="bold"
+                            android:textColor="?attr/colorPrimary"
+                            android:letterSpacing="0.08"
+                            android:background="?attr/colorSurfaceVariant" />
+
+                    </LinearLayout>
+
+                </LinearLayout>
+
+            </LinearLayout>
+
         </LinearLayout>
 
-        <!-- Results -->
-        <androidx.recyclerview.widget.RecyclerView
-            android:id="@+id/recyclerView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:visibility="gone" />
-
-    </FrameLayout>
+    </androidx.core.widget.NestedScrollView>
 
 </LinearLayout>
