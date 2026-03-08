@@ -1,20 +1,29 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
+val localProps = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) localProps.load(localPropsFile.inputStream())
+
 android {
-    namespace = "com.shanekoh.lenssearch"
+    namespace = "com.shanekoh.fitchecker"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.shanekoh.lenssearch"
+        applicationId = "com.shanekoh.fitchecker"
         minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "ANTHROPIC_API_KEY", "\"${localProps["ANTHROPIC_API_KEY"] ?: ""}\"")
+        buildConfigField("String", "LYKDAT_API_KEY", "\"${localProps["LYKDAT_API_KEY"] ?: ""}\"")
     }
 
     buildTypes {
@@ -25,6 +34,9 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+    buildFeatures {
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
