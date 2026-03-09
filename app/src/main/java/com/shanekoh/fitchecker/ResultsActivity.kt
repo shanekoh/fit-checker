@@ -35,6 +35,22 @@ data class Product(
 
 data class ResultGroup(val itemName: String, val products: List<Product>)
 
+data class OutfitAnalysis(
+    val description: String,
+    val searchQuery: String,
+    val colors: List<String>,
+    val style: String,
+    val occasion: String,
+    val silhouette: String,
+    val items: List<String>,
+    val texture: String,
+    val material: String,
+    val fit: String,
+    val details: String,
+    val neckline: String,
+    val trimming: String
+)
+
 class ResultsActivity : AppCompatActivity() {
 
     companion object {
@@ -66,7 +82,7 @@ class ResultsActivity : AppCompatActivity() {
     // 4. Re-ranked results trigger Phase 2 (product columns)
 
     private fun runPipeline(imageFile: File, retailers: List<Retailer>) {
-        val claudeRef = AtomicReference<Triple<String, String, List<String>>?>()
+        val claudeRef = AtomicReference<OutfitAnalysis?>()
         val lykdatRef = AtomicReference<List<ResultGroup>?>()
         val latch = CountDownLatch(2)
 
@@ -75,7 +91,7 @@ class ResultsActivity : AppCompatActivity() {
             try {
                 val result = callClaude(imageFile)
                 claudeRef.set(result)
-                runOnUiThread { showPhase1(imageFile, result.first, result.second) }
+                runOnUiThread { showPhase1(imageFile, result.description, result.searchQuery) }
             } catch (e: Exception) {
                 runOnUiThread { showPhase1(imageFile, "", "") }
             }
@@ -102,12 +118,12 @@ class ResultsActivity : AppCompatActivity() {
             return
         }
 
-        // Re-rank: Claude looks at the image + Lykdat products, picks best color+style matches
+        // Re-rank: Claude scores each product 0-10 against outfit colors, style, occasion, silhouette
         val reranked = try {
-            callClaudeRerank(imageFile, analysis?.third ?: emptyList(), rawGroups)
+            callClaudeRerank(imageFile, analysis, rawGroups)
         } catch (e: Exception) {
             // Fallback: basic color filter if re-ranking fails
-            applyColorFilter(rawGroups, analysis?.third ?: emptyList())
+            applyColorFilter(rawGroups, analysis?.colors ?: emptyList())
         }
 
         runOnUiThread { showPhase2(reranked, retailers) }
@@ -194,18 +210,28 @@ class ResultsActivity : AppCompatActivity() {
 
     // ── API calls ─────────────────────────────────────────────────────────────
 
-    private fun callClaude(imageFile: File): Triple<String, String, List<String>> {
+    private fun callClaude(imageFile: File): OutfitAnalysis {
         val base64Image = android.util.Base64.encodeToString(imageFile.readBytes(), android.util.Base64.NO_WRAP)
         val prompt = """
             Analyze the outfit in this image and return ONLY valid JSON with no markdown:
             {
               "description": "1-2 sentence description of the outfit",
               "search_query": "concise search terms to find similar items",
-              "colors": ["every dominant color as simple words e.g. white, black, navy, beige, cream, ivory, camel, rust, olive, emerald, burgundy, coral, tan, brown, grey, pink, red, green, blue, yellow, orange, purple"]
+              "colors": ["every dominant color as simple words e.g. white, black, navy, beige, cream, ivory, camel, rust, olive, emerald, burgundy, coral, tan, brown, grey, pink, red, green, blue, yellow, orange, purple"],
+              "style": "one of: casual, smart-casual, formal, streetwear, athleisure, boho, minimalist, preppy, edgy",
+              "occasion": "one of: everyday, work, evening, date, sport, beach, festival",
+              "silhouette": "brief description e.g. oversized top with slim trousers, flowy midi dress, fitted co-ord",
+              "items": ["list each detected clothing or accessory item e.g. white linen shirt, navy chinos, white sneakers"],
+              "texture": "visible surface texture e.g. smooth, ribbed, waffle-knit, quilted, distressed, glossy, matte",
+              "material": "inferred fabric e.g. linen, cotton, denim, silk, leather, knit, chiffon, wool, synthetic",
+              "fit": "how the clothing sits on the body e.g. slim, regular, oversized, baggy, cropped, relaxed, tailored",
+              "details": "notable design details e.g. cargo pockets, patch pockets, pleats, ruffles, buttons, zips, drawstring",
+              "neckline": "neckline style e.g. crew neck, V-neck, scoop neck, turtleneck, collared, off-shoulder, square neck",
+              "trimming": "any trim or embellishment e.g. contrast stitching, piping, lace trim, embroidery, logo patch, none"
             }
         """.trimIndent()
 
-        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 512)
+        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 768)
         val rawText = JSONObject(responseText)
             .getJSONArray("content").getJSONObject(0).getString("text")
             .trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
@@ -213,14 +239,31 @@ class ResultsActivity : AppCompatActivity() {
         val parsed = JSONObject(rawText)
         val colorsArray = parsed.optJSONArray("colors") ?: JSONArray()
         val colors = (0 until colorsArray.length()).map { colorsArray.getString(it).lowercase() }
-        return Triple(parsed.getString("description"), parsed.getString("search_query"), colors)
+        val itemsArray = parsed.optJSONArray("items") ?: JSONArray()
+        val items = (0 until itemsArray.length()).map { itemsArray.getString(it) }
+
+        return OutfitAnalysis(
+            description = parsed.optString("description", ""),
+            searchQuery = parsed.optString("search_query", ""),
+            colors = colors,
+            style = parsed.optString("style", ""),
+            occasion = parsed.optString("occasion", ""),
+            silhouette = parsed.optString("silhouette", ""),
+            items = items,
+            texture = parsed.optString("texture", ""),
+            material = parsed.optString("material", ""),
+            fit = parsed.optString("fit", ""),
+            details = parsed.optString("details", ""),
+            neckline = parsed.optString("neckline", ""),
+            trimming = parsed.optString("trimming", "")
+        )
     }
 
-    // Re-ranking pass: Claude sees the outfit image + Lykdat product list,
-    // picks only products that truly match in color and style.
+    // Re-ranking pass: Claude scores each product 0-10 against the full outfit context,
+    // then results are sorted by score descending. Products scoring < 4 are dropped.
     private fun callClaudeRerank(
         imageFile: File,
-        colors: List<String>,
+        analysis: OutfitAnalysis?,
         groups: List<ResultGroup>
     ): List<ResultGroup> {
         val base64Image = android.util.Base64.encodeToString(imageFile.readBytes(), android.util.Base64.NO_WRAP)
@@ -233,23 +276,38 @@ class ResultsActivity : AppCompatActivity() {
             }.joinToString("\n")
         }.joinToString("\n\n")
 
-        val colorStr = if (colors.isNotEmpty()) colors.joinToString(", ") else "unknown"
+        val contextStr = buildString {
+            analysis?.let { a ->
+                if (a.colors.isNotEmpty()) appendLine("Colors: ${a.colors.joinToString(", ")}")
+                if (a.style.isNotEmpty()) appendLine("Style: ${a.style}")
+                if (a.occasion.isNotEmpty()) appendLine("Occasion: ${a.occasion}")
+                if (a.silhouette.isNotEmpty()) appendLine("Silhouette: ${a.silhouette}")
+                if (a.fit.isNotEmpty()) appendLine("Fit: ${a.fit}")
+                if (a.material.isNotEmpty()) appendLine("Material: ${a.material}")
+                if (a.texture.isNotEmpty()) appendLine("Texture: ${a.texture}")
+                if (a.neckline.isNotEmpty()) appendLine("Neckline: ${a.neckline}")
+                if (a.details.isNotEmpty()) appendLine("Details: ${a.details}")
+                if (a.trimming.isNotEmpty()) appendLine("Trimming: ${a.trimming}")
+                if (a.items.isNotEmpty()) appendLine("Detected items: ${a.items.joinToString(", ")}")
+            }
+        }.trim().ifEmpty { "No outfit context available" }
 
         val prompt = """
-            The outfit in the image has these dominant colors: $colorStr.
+            The outfit in the image has these characteristics:
+            $contextStr
 
-            For each product group below, select ONLY the product indices that:
-            1. Match the outfit's EXACT COLORS (most important — reject wrong colors)
-            2. Match the outfit's STYLE (silhouette, formality, aesthetic)
+            Score each product 0-10 on how well it matches this outfit:
+            - Color match is most important (wrong color = score 0-2)
+            - Also consider style, occasion, and silhouette fit
+            - 10 = perfect match, 5 = acceptable, 0-3 = wrong color or style
 
-            Be strict. If nothing matches well, return an empty keep list.
             Return ONLY valid JSON (no markdown, no explanation):
-            {"groups": [{"keep": [0, 2]}, {"keep": [1]}, {"keep": []}]}
+            {"groups": [{"products": [{"index": 0, "score": 8}, {"index": 1, "score": 2}]}, ...]}
 
             $groupsText
         """.trimIndent()
 
-        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 256)
+        val responseText = postToAnthropic(base64Image, prompt, maxTokens = 512)
         val rawText = JSONObject(responseText)
             .getJSONArray("content").getJSONObject(0).getString("text")
             .trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
@@ -259,12 +317,20 @@ class ResultsActivity : AppCompatActivity() {
         return groups.mapIndexed { gi, group ->
             if (gi >= parsedGroups.length()) return@mapIndexed group
 
-            val keepArray = parsedGroups.getJSONObject(gi).optJSONArray("keep") ?: JSONArray()
-            val keepIndices = (0 until keepArray.length()).map { keepArray.getInt(it) }.toSet()
+            val productsArray = parsedGroups.getJSONObject(gi).optJSONArray("products") ?: JSONArray()
+            val scoreMap = (0 until productsArray.length()).associate { k ->
+                val obj = productsArray.getJSONObject(k)
+                obj.getInt("index") to obj.getDouble("score")
+            }
 
-            val kept = group.products.take(15).filterIndexed { pi, _ -> pi in keepIndices }
-            // Fallback to top 3 by score if Claude kept nothing
-            ResultGroup(group.itemName, kept.ifEmpty { group.products.sortedByDescending { it.score }.take(3) })
+            // Apply scores, drop anything below 4, sort by score desc
+            val scored = group.products.take(15).mapIndexedNotNull { pi, p ->
+                val score = scoreMap[pi] ?: return@mapIndexedNotNull null
+                if (score < 4.0) null else p.copy(score = score)
+            }.sortedByDescending { it.score }
+
+            // Fallback to top 3 by Lykdat score if nothing passed threshold
+            ResultGroup(group.itemName, scored.ifEmpty { group.products.sortedByDescending { it.score }.take(3) })
         }
     }
 
@@ -351,7 +417,7 @@ class ResultsActivity : AppCompatActivity() {
         }
     }
 
-    // Fallback color filter (used if re-ranking API call fails)
+    // Fallback color text filter (used if re-ranking API call fails)
     private fun applyColorFilter(groups: List<ResultGroup>, colors: List<String>): List<ResultGroup> {
         if (colors.isEmpty()) return groups
         return groups.map { group ->
